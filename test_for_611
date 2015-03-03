@@ -45,7 +45,6 @@
 static http_parser *parser;
 
 struct message {
-  const char *name; // for debugging purposes
   const char *raw;
   enum http_parser_type type;
   enum http_method method;
@@ -82,34 +81,8 @@ static int currently_parsing_eof;
 static struct message messages[5];
 static int num_messages;
 
-/* * R E Q U E S T S * */
-const struct message requests =
-#define CURL_GET 0
-{.name= "curl get"
-  ,.type= HTTP_REQUEST
-  ,.raw= "GET /test HTTP/1.1\r\n"
-         "User-Agent: curl/7.18.0 (i486-pc-linux-gnu) libcurl/7.18.0 OpenSSL/0.9.8g zlib/1.2.3.3 libidn/1.1\r\n"
-         "Host: 0.0.0.0=5000\r\n"
-         "Accept: */*\r\n"
-         "\r\n"
-  ,.should_keep_alive= TRUE
-  ,.message_complete_on_eof= FALSE
-  ,.http_major= 1
-  ,.http_minor= 1
-  ,.method= HTTP_GET
-  ,.query_string= ""
-  ,.fragment= ""
-  ,.request_path= "/test"
-  ,.request_url= "/test"
-  ,.num_headers= 3
-  ,.headers=
-    { { "User-Agent", "curl/7.18.0 (i486-pc-linux-gnu) libcurl/7.18.0 OpenSSL/0.9.8g zlib/1.2.3.3 libidn/1.1" }
-    , { "Host", "0.0.0.0=5000" }
-    , { "Accept", "*/*" }
-    }
-  ,.body= ""
-  };
 
+#if 0
 /* * R E S P O N S E S * */
 const struct message responses =
 #define GOOGLE_301 0
@@ -155,7 +128,7 @@ const struct message responses =
           "<A HREF=\"http://www.google.com/\">here</A>.\r\n"
           "</BODY></HTML>\r\n"
   };
-
+#endif 
 /* strnlen() is a POSIX.2008 addition. Can't rely on it being available so
  * define it ourselves.
  */
@@ -437,9 +410,28 @@ mtk_parse_message (const struct message *message)
 }
 
 int
-mainTestOn611 (void)
+main (void)
 {
   parser = NULL;
+  /* * R E S P O N S E S * */
+  struct message responses;
+  responses.raw = "HTTP/1.1 301 Moved Permanently\r\n"
+         "Location: http://www.google.com/\r\n"
+         "Content-Type: text/html; charset=UTF-8\r\n"
+         "Date: Sun, 26 Apr 2009 11:11:49 GMT\r\n"
+         "Expires: Tue, 26 May 2009 11:11:49 GMT\r\n"
+         "X-$PrototypeBI-Version: 1.6.0.3\r\n" /* $ char in header field */
+         "Cache-Control: public, max-age=2592000\r\n"
+         "Server: gws\r\n"
+         "Content-Length:  219  \r\n"
+         "\r\n"
+         "<HTML><HEAD><meta http-equiv=\"content-type\" content=\"text/html;charset=utf-8\">\n"
+         "<TITLE>301 Moved</TITLE></HEAD><BODY>\n"
+         "<H1>301 Moved</H1>\n"
+         "The document has moved\n"
+         "<A HREF=\"http://www.google.com/\">here</A>.\r\n"
+         "</BODY></HTML>\r\n";
+  responses.type = HTTP_RESPONSE;
 
   unsigned long version;
   unsigned major;
