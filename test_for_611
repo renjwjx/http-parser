@@ -1,0 +1,460 @@
+/* Copyright Joyent, Inc. and other Node contributors. All rights reserved.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ */
+#include "http_parser.h"
+#include <stdlib.h>
+#include <assert.h>
+#include <stdio.h>
+#include <stdlib.h> /* rand */
+#include <string.h>
+#include <stdarg.h>
+
+#if defined(__APPLE__)
+# undef strlcat
+# undef strlncpy
+# undef strlcpy
+#endif  /* defined(__APPLE__) */
+
+#undef TRUE
+#define TRUE 1
+#undef FALSE
+#define FALSE 0
+
+#define MAX_HEADERS 13
+#define MAX_ELEMENT_SIZE 2048
+
+#define MIN(a,b) ((a) < (b) ? (a) : (b))
+
+static http_parser *parser;
+
+struct message {
+  const char *name; // for debugging purposes
+  const char *raw;
+  enum http_parser_type type;
+  enum http_method method;
+  int status_code;
+  char response_status[MAX_ELEMENT_SIZE];
+  char request_path[MAX_ELEMENT_SIZE];
+  char request_url[MAX_ELEMENT_SIZE];
+  char fragment[MAX_ELEMENT_SIZE];
+  char query_string[MAX_ELEMENT_SIZE];
+  char body[MAX_ELEMENT_SIZE];
+  size_t body_size;
+  const char *host;
+  const char *userinfo;
+  uint16_t port;
+  int num_headers;
+  enum { NONE=0, FIELD, VALUE } last_header_element;
+  char headers [MAX_HEADERS][2][MAX_ELEMENT_SIZE];
+  int should_keep_alive;
+
+  const char *upgrade; // upgraded body
+
+  unsigned short http_major;
+  unsigned short http_minor;
+
+  int message_begin_cb_called;
+  int headers_complete_cb_called;
+  int message_complete_cb_called;
+  int message_complete_on_eof;
+  int body_is_final;
+};
+
+static int currently_parsing_eof;
+
+static struct message messages[5];
+static int num_messages;
+
+/* * R E Q U E S T S * */
+const struct message requests =
+#define CURL_GET 0
+{.name= "curl get"
+  ,.type= HTTP_REQUEST
+  ,.raw= "GET /test HTTP/1.1\r\n"
+         "User-Agent: curl/7.18.0 (i486-pc-linux-gnu) libcurl/7.18.0 OpenSSL/0.9.8g zlib/1.2.3.3 libidn/1.1\r\n"
+         "Host: 0.0.0.0=5000\r\n"
+         "Accept: */*\r\n"
+         "\r\n"
+  ,.should_keep_alive= TRUE
+  ,.message_complete_on_eof= FALSE
+  ,.http_major= 1
+  ,.http_minor= 1
+  ,.method= HTTP_GET
+  ,.query_string= ""
+  ,.fragment= ""
+  ,.request_path= "/test"
+  ,.request_url= "/test"
+  ,.num_headers= 3
+  ,.headers=
+    { { "User-Agent", "curl/7.18.0 (i486-pc-linux-gnu) libcurl/7.18.0 OpenSSL/0.9.8g zlib/1.2.3.3 libidn/1.1" }
+    , { "Host", "0.0.0.0=5000" }
+    , { "Accept", "*/*" }
+    }
+  ,.body= ""
+  };
+
+/* * R E S P O N S E S * */
+const struct message responses =
+#define GOOGLE_301 0
+{.name= "google 301"
+  ,.type= HTTP_RESPONSE
+  ,.raw= "HTTP/1.1 301 Moved Permanently\r\n"
+         "Location: http://www.google.com/\r\n"
+         "Content-Type: text/html; charset=UTF-8\r\n"
+         "Date: Sun, 26 Apr 2009 11:11:49 GMT\r\n"
+         "Expires: Tue, 26 May 2009 11:11:49 GMT\r\n"
+         "X-$PrototypeBI-Version: 1.6.0.3\r\n" /* $ char in header field */
+         "Cache-Control: public, max-age=2592000\r\n"
+         "Server: gws\r\n"
+         "Content-Length:  219  \r\n"
+         "\r\n"
+         "<HTML><HEAD><meta http-equiv=\"content-type\" content=\"text/html;charset=utf-8\">\n"
+         "<TITLE>301 Moved</TITLE></HEAD><BODY>\n"
+         "<H1>301 Moved</H1>\n"
+         "The document has moved\n"
+         "<A HREF=\"http://www.google.com/\">here</A>.\r\n"
+         "</BODY></HTML>\r\n"
+  ,.should_keep_alive= TRUE
+  ,.message_complete_on_eof= FALSE
+  ,.http_major= 1
+  ,.http_minor= 1
+  ,.status_code= 301
+  ,.response_status= "Moved Permanently"
+  ,.num_headers= 8
+  ,.headers=
+    { { "Location", "http://www.google.com/" }
+    , { "Content-Type", "text/html; charset=UTF-8" }
+    , { "Date", "Sun, 26 Apr 2009 11:11:49 GMT" }
+    , { "Expires", "Tue, 26 May 2009 11:11:49 GMT" }
+    , { "X-$PrototypeBI-Version", "1.6.0.3" }
+    , { "Cache-Control", "public, max-age=2592000" }
+    , { "Server", "gws" }
+    , { "Content-Length", "219  " }
+    }
+  ,.body= "<HTML><HEAD><meta http-equiv=\"content-type\" content=\"text/html;charset=utf-8\">\n"
+          "<TITLE>301 Moved</TITLE></HEAD><BODY>\n"
+          "<H1>301 Moved</H1>\n"
+          "The document has moved\n"
+          "<A HREF=\"http://www.google.com/\">here</A>.\r\n"
+          "</BODY></HTML>\r\n"
+  };
+
+/* strnlen() is a POSIX.2008 addition. Can't rely on it being available so
+ * define it ourselves.
+ */
+size_t
+strnlen(const char *s, size_t maxlen)
+{
+  const char *p;
+
+  p = memchr(s, '\0', maxlen);
+  if (p == NULL)
+    return maxlen;
+
+  return p - s;
+}
+
+size_t
+strlncat(char *dst, size_t len, const char *src, size_t n)
+{
+  size_t slen;
+  size_t dlen;
+  size_t rlen;
+  size_t ncpy;
+
+  slen = strnlen(src, n);
+  dlen = strnlen(dst, len);
+
+  if (dlen < len) {
+    rlen = len - dlen;
+    ncpy = slen < rlen ? slen : (rlen - 1);
+    memcpy(dst + dlen, src, ncpy);
+    dst[dlen + ncpy] = '\0';
+  }
+
+  assert(len > slen + dlen);
+  return slen + dlen;
+}
+
+size_t
+strlcat(char *dst, const char *src, size_t len)
+{
+  return strlncat(dst, len, src, (size_t) -1);
+}
+
+size_t
+strlncpy(char *dst, size_t len, const char *src, size_t n)
+{
+  size_t slen;
+  size_t ncpy;
+
+  slen = strnlen(src, n);
+
+  if (len > 0) {
+    ncpy = slen < len ? slen : (len - 1);
+    memcpy(dst, src, ncpy);
+    dst[ncpy] = '\0';
+  }
+
+  assert(len > slen);
+  return slen;
+}
+
+size_t
+strlcpy(char *dst, const char *src, size_t len)
+{
+  return strlncpy(dst, len, src, (size_t) -1);
+}
+
+int
+request_url_cb (http_parser *p, const char *buf, size_t len)
+{
+
+  assert(p == parser);
+  strlncat(messages[num_messages].request_url,
+           sizeof(messages[num_messages].request_url),
+           buf,
+           len);
+  printf("request_url_cb buf = %s\n", messages[num_messages].request_url);           
+  return 0;
+}
+
+int
+header_field_cb (http_parser *p, const char *buf, size_t len)
+{
+
+  assert(p == parser);
+  struct message *m = &messages[num_messages];
+
+  if (m->last_header_element != FIELD)
+    m->num_headers++;
+
+  strlncat(m->headers[m->num_headers-1][0],
+           sizeof(m->headers[m->num_headers-1][0]),
+           buf,
+           len);
+
+  m->last_header_element = FIELD;
+  printf("header_field_cb buf= %s\n", m->headers[m->num_headers-1][0]);
+  return 0;
+}
+
+int
+header_value_cb (http_parser *p, const char *buf, size_t len)
+{
+
+  assert(p == parser);
+  struct message *m = &messages[num_messages];
+
+  strlncat(m->headers[m->num_headers-1][1],
+           sizeof(m->headers[m->num_headers-1][1]),
+           buf,
+           len);
+
+  m->last_header_element = VALUE;
+  printf("header_value_cb buf = %s\n", m->headers[m->num_headers-1][1]);
+  return 0;
+}
+
+void
+check_body_is_final (const http_parser *p)
+{
+  printf("check_body_is_final\n");
+  if (messages[num_messages].body_is_final) {
+    fprintf(stderr, "\n\n *** Error http_body_is_final() should return 1 "
+                    "on last on_body callback call "
+                    "but it doesn't! ***\n\n");
+    assert(0);
+    abort();
+  }
+  messages[num_messages].body_is_final = http_body_is_final(p);
+}
+
+int
+body_cb (http_parser *p, const char *buf, size_t len)
+{
+  assert(p == parser);
+  strlncat(messages[num_messages].body,
+           sizeof(messages[num_messages].body),
+           buf,
+           len);
+  messages[num_messages].body_size += len;
+  check_body_is_final(p);
+  printf("body_cb buf = %s\n", messages[num_messages].body);
+  return 0;
+}
+
+int
+count_body_cb (http_parser *p, const char *buf, size_t len)
+{
+  printf("count_body_cb buf = %s\n", buf);
+  assert(p == parser);
+  assert(buf);
+  messages[num_messages].body_size += len;
+  check_body_is_final(p);
+  return 0;
+}
+
+int
+message_begin_cb (http_parser *p)
+{
+  printf("message_begin_cb\n");
+  assert(p == parser);
+  messages[num_messages].message_begin_cb_called = TRUE;
+  return 0;
+}
+
+int
+headers_complete_cb (http_parser *p)
+{
+  printf("headers_complete_cb\n");
+  assert(p == parser);
+  messages[num_messages].method = parser->method;
+  messages[num_messages].status_code = parser->status_code;
+  messages[num_messages].http_major = parser->http_major;
+  messages[num_messages].http_minor = parser->http_minor;
+  messages[num_messages].headers_complete_cb_called = TRUE;
+  messages[num_messages].should_keep_alive = http_should_keep_alive(parser);
+  return 0;
+}
+
+int
+message_complete_cb (http_parser *p)
+{
+  printf("message_complete_cb\n");
+  assert(p == parser);
+  if (messages[num_messages].should_keep_alive != http_should_keep_alive(parser))
+  {
+    fprintf(stderr, "\n\n *** Error http_should_keep_alive() should have same "
+                    "value in both on_message_complete and on_headers_complete "
+                    "but it doesn't! ***\n\n");
+    assert(0);
+    abort();
+  }
+
+  if (messages[num_messages].body_size &&
+      http_body_is_final(p) &&
+      !messages[num_messages].body_is_final)
+  {
+    fprintf(stderr, "\n\n *** Error http_body_is_final() should return 1 "
+                    "on last on_body callback call "
+                    "but it doesn't! ***\n\n");
+    assert(0);
+    abort();
+  }
+
+  messages[num_messages].message_complete_cb_called = TRUE;
+
+  messages[num_messages].message_complete_on_eof = currently_parsing_eof;
+
+  num_messages++;
+  return 0;
+}
+
+int
+response_status_cb (http_parser *p, const char *buf, size_t len)
+{
+  assert(p == parser);
+  strlncat(messages[num_messages].response_status,
+           sizeof(messages[num_messages].response_status),
+           buf,
+           len);
+  printf("response_status_cb buf = %s\n", messages[num_messages].response_status);           
+  return 0;
+}
+
+static http_parser_settings settings =
+  {.on_message_begin = message_begin_cb
+  ,.on_header_field = header_field_cb
+  ,.on_header_value = header_value_cb
+  ,.on_url = request_url_cb
+  ,.on_status = response_status_cb
+  ,.on_body = body_cb
+  ,.on_headers_complete = headers_complete_cb
+  ,.on_message_complete = message_complete_cb
+  };
+
+void
+parser_init (enum http_parser_type type)
+{
+  num_messages = 0;
+
+  assert(parser == NULL);
+
+  parser = malloc(sizeof(http_parser));
+
+  http_parser_init(parser, type);
+
+  memset(&messages, 0, sizeof messages);
+
+}
+
+void
+parser_free ()
+{
+  assert(parser);
+  free(parser);
+  parser = NULL;
+}
+
+size_t parse (const char *buf, size_t len)
+{
+  size_t nparsed;
+  currently_parsing_eof = (len == 0);
+  nparsed = http_parser_execute(parser, &settings, buf, len);
+  return nparsed;
+}
+
+void
+mtk_parse_message (const struct message *message)
+{
+  size_t raw_len = strlen(message->raw);
+
+    parser_init(message->type);
+
+    size_t read;
+    const char *msg1 = message->raw;
+    read = parse(msg1, raw_len);
+
+    parser_free();
+}
+
+int
+mainTestOn611 (void)
+{
+  parser = NULL;
+
+  unsigned long version;
+  unsigned major;
+  unsigned minor;
+  unsigned patch;
+
+  version = http_parser_version();
+  major = (version >> 16) & 255;
+  minor = (version >> 8) & 255;
+  patch = version & 255;
+  printf("http_parser v%u.%u.%u (0x%06lx)\n", major, minor, patch, version);
+
+  printf("sizeof(http_parser) = %u\n", (unsigned int)sizeof(http_parser));
+
+  mtk_parse_message(&responses);
+
+  return 0;
+}
